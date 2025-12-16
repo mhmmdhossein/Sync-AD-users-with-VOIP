@@ -3,9 +3,59 @@ Import-Module ActiveDirectory
 $logFile = "C:\Reports\phonebook.log"
 "==== Run started $(Get-Date) ====" | Out-File $logFile -Encoding UTF8
 
-$outFile  = "C:\Reports\phonebook.xml"
-$htmlFile = "C:\Reports\phonebook.html"
+$outFile  = "C:\Reports\cn.xml"
+$htmlFile = "C:\Users\Administrator\Desktop\share\req\phonebook.html"
 New-Item -ItemType Directory -Path (Split-Path $outFile) -Force | Out-Null
+
+Add-Type -AssemblyName System.Web
+
+# ---------- Helpers ----------
+function Split-And-CleanPhones {
+    param([object[]]$Values)
+
+    $raw = @($Values) | Where-Object { $_ -ne $null -and "$_".Trim() -ne "" }
+
+    $raw |
+        ForEach-Object { "$_" -split "[`r`n,;|/\\ ]+" } |
+        ForEach-Object { $_.Trim() } |
+        Where-Object { $_ } |
+        ForEach-Object { $_ -replace "[^0-9\+]", "" } |
+        Where-Object { $_ } |
+        Select-Object -Unique
+}
+
+function Get-PhonesFromAD {
+    param($User)
+
+    $vals = @()
+    if ($User.telephoneNumber) { $vals += $User.telephoneNumber }
+    if ($User.otherTelephone)  { $vals += @($User.otherTelephone) }
+
+    Split-And-CleanPhones -Values $vals
+}
+
+function PhonesToHtmlCell {
+    param([string[]]$Phones)
+
+    if (-not $Phones -or $Phones.Count -eq 0) { return "" }
+
+    # تک شماره: عادی
+    if ($Phones.Count -eq 1) {
+        return [System.Web.HttpUtility]::HtmlEncode($Phones[0])
+    }
+
+    # چند شماره:
+    # شماره اول سرتیتر، بقیه زیرش li
+    $first = [System.Web.HttpUtility]::HtmlEncode($Phones[0])
+    $rest  = $Phones | Select-Object -Skip 1
+
+    $lis = $rest | ForEach-Object {
+        "<li>" + [System.Web.HttpUtility]::HtmlEncode($_) + "</li>"
+    }
+
+    return "<div style='white-space:nowrap; font-weight:600;'>$first</div>" +
+           "<ul style='margin:4px 0 0 0; padding-inline-start:18px;'>" + ($lis -join "") + "</ul>"
+}
 
 # ---------- XML ----------
 $xml  = New-Object System.Xml.XmlDocument
@@ -29,8 +79,8 @@ function Add-PbGroup {
 Add-PbGroup 1 "Blacklist"
 Add-PbGroup 2 "Whitelist"
 
-# ---------- AD Query ----------
-$users = Get-ADUser -Filter * -Properties GivenName,Surname,DisplayName,SamAccountName,Enabled,Department,Title,telephoneNumber,ipPhone |
+# ---------- AD Query (NO ipPhone) ----------
+$users = Get-ADUser -Filter * -Properties GivenName,Surname,DisplayName,SamAccountName,Enabled,Department,Title,telephoneNumber,otherTelephone |
 Where-Object {
     $_.Enabled -eq $true -and
     $_.SamAccountName -notlike "HealthMailbox*" -and
@@ -45,8 +95,8 @@ $rows = New-Object System.Collections.Generic.List[object]
 $id = 1
 foreach ($u in $users) {
 
-    $numValue = if ($u.ipPhone) { $u.ipPhone } elseif ($u.telephoneNumber) { $u.telephoneNumber } else { $null }
-    if (-not $numValue) { continue }   # حذف افراد بدون شماره (اگر نمی‌خوای، این خط رو بردار)
+    $phones = @(Get-PhonesFromAD $u)
+    if ($phones.Count -eq 0) { continue }
 
     $deptOrTitle = if ($u.Department) { $u.Department } elseif ($u.Title) { $u.Title } else { "" }
 
@@ -54,11 +104,11 @@ foreach ($u in $users) {
     Write-Host "  SamAccountName:" $u.SamAccountName
     Write-Host "  GivenName     :" $u.GivenName
     Write-Host "  Surname       :" $u.Surname
-    Write-Host "  Phone         :" $numValue
+    Write-Host "  Phones        :" ($phones -join ", ")
     Write-Host "-----------------------------"
 
-    $logLine = "{0} | User={1} | GivenName={2} | Surname={3} | Phone={4}" -f `
-        (Get-Date), $u.SamAccountName, $u.GivenName, $u.Surname, $numValue
+    $logLine = "{0} | User={1} | GivenName={2} | Surname={3} | Phones={4}" -f `
+        (Get-Date), $u.SamAccountName, $u.GivenName, $u.Surname, ($phones -join ", ")
     $logLine | Out-File $logFile -Append -Encoding UTF8
 
     # --- XML Contact ---
@@ -75,15 +125,34 @@ foreach ($u in $users) {
     $fr = $xml.CreateElement("Frequent"); $fr.InnerText = "0"
     $contact.AppendChild($fr) | Out-Null
 
-    $phone = $xml.CreateElement("Phone")
-    $typeAttr = $xml.CreateAttribute("type"); $typeAttr.Value = "Work"
-    $phone.Attributes.Append($typeAttr) | Out-Null
+    # XML phone typing rule:
+    # - اگر فقط یکی بود => Home
+    # - اگر چندتا بود => اول RingGroup، بقیه Phone1, Phone2, ...
+    if ($phones.Count -eq 1) {
+        $phone = $xml.CreateElement("Phone")
+        $phone.SetAttribute("type","Home")
 
-    $pn = $xml.CreateElement("phonenumber"); $pn.InnerText = "$numValue"
-    $ai = $xml.CreateElement("accountindex"); $ai.InnerText = "0"
-    $phone.AppendChild($pn) | Out-Null
-    $phone.AppendChild($ai) | Out-Null
-    $contact.AppendChild($phone) | Out-Null
+        $pn = $xml.CreateElement("phonenumber"); $pn.InnerText = "$($phones[0])"
+        $ai = $xml.CreateElement("accountindex"); $ai.InnerText = "0"
+        $phone.AppendChild($pn) | Out-Null
+        $phone.AppendChild($ai) | Out-Null
+        $contact.AppendChild($phone) | Out-Null
+    }
+    else {
+        for($i=0; $i -lt $phones.Count; $i++){
+            $t = if($i -eq 0) { "RingGroup" } else { "Phone$($i)" }  # i=1 => Phone1
+            $p = $phones[$i]
+
+            $phone = $xml.CreateElement("Phone")
+            $phone.SetAttribute("type",$t)
+
+            $pn = $xml.CreateElement("phonenumber"); $pn.InnerText = "$p"
+            $ai = $xml.CreateElement("accountindex"); $ai.InnerText = "0"
+            $phone.AppendChild($pn) | Out-Null
+            $phone.AppendChild($ai) | Out-Null
+            $contact.AppendChild($phone) | Out-Null
+        }
+    }
 
     $pr = $xml.CreateElement("Primary"); $pr.InnerText = "0"
     $contact.AppendChild($pr) | Out-Null
@@ -99,7 +168,7 @@ foreach ($u in $users) {
         SamAccountName= $u.SamAccountName
         FirstName     = $(if ($u.GivenName) { $u.GivenName } else { "" })
         LastName      = $(if ($u.Surname)   { $u.Surname }   else { "" })
-        Phone         = $numValue
+        Phone         = PhonesToHtmlCell -Phones $phones
         Job           = $deptOrTitle
     }) | Out-Null
 
@@ -112,57 +181,146 @@ Write-Host "Done XML: $outFile"
 
 # ---------- Save HTML ----------
 $generatedAt = Get-Date
+
 $head = @"
 <meta charset="utf-8">
 <title>Phonebook</title>
 <style>
 body{font-family:Segoe UI,Tahoma,Arial;direction:rtl;margin:20px}
-table{border-collapse:collapse;width:100%}
-th,td{border:1px solid #ddd;padding:8px}
-th{cursor:pointer;position:sticky;top:0;background:#f5f5f5}
+table{border-collapse:collapse;width:max-content;margin:auto;}
+th,td{border:1px solid #ddd;padding:8px; vertical-align:top}
+th{cursor:pointer;position:sticky;top:0;background:#f5f5f5;user-select:none;white-space:nowrap}
+th .arrow{font-size:12px;margin-right:6px;color:#666}
 tr:nth-child(even){background:#fafafa}
 .small{color:#666;font-size:12px;margin-bottom:10px}
-input{width:320px;padding:8px;margin:10px 0}
+input{width:320px;padding:8px;margin:auto;}
+a{color:inherit;text-decoration:underline}
+td ul{margin:4px 0 0 0; padding-inline-start:18px}
 </style>
 <script>
-function sortTable(n){
-  var table=document.getElementById("pb"), switching=true, dir="asc", sw, i, x, y, shouldSwitch;
-  while(switching){
-    switching=false; var rows=table.rows;
-    for(i=1;i<rows.length-1;i++){
-      shouldSwitch=false;
-      x=rows[i].getElementsByTagName("TD")[n].innerText.toLowerCase();
-      y=rows[i+1].getElementsByTagName("TD")[n].innerText.toLowerCase();
-      if((dir=="asc" && x>y) || (dir=="desc" && x<y)){ shouldSwitch=true; break; }
+let sortState = { col: -1, dir: 1 }; // 1 asc, -1 desc
+function cellText(row, idx){
+  const td = row.cells[idx];
+  if(!td) return "";
+  return (td.textContent || "").trim();
+}
+function sortTable(idx){
+  const table = document.getElementById("pb");
+  if(!table) return;
+  const dataRows = Array.from(table.rows).slice(1);
+  if(dataRows.length === 0) return;
+
+  const th = table.rows[0].cells[idx];
+  const type = (th && th.getAttribute("data-type")) ? th.getAttribute("data-type") : "text";
+
+  if(sortState.col === idx) sortState.dir *= -1;
+  else { sortState.col = idx; sortState.dir = 1; }
+  const dir = sortState.dir;
+
+  dataRows.sort((ra, rb) => {
+    let a = cellText(ra, idx);
+    let b = cellText(rb, idx);
+    if(type === "number"){
+      const na = parseFloat(a.replace(/[^0-9.\-]/g,"")) || 0;
+      const nb = parseFloat(b.replace(/[^0-9.\-]/g,"")) || 0;
+      return (na - nb) * dir;
     }
-    if(shouldSwitch){ rows[i].parentNode.insertBefore(rows[i+1], rows[i]); switching=true; sw=true; }
-    else { if(dir=="asc"){ dir="desc"; switching=true; } }
+    return a.localeCompare(b, undefined, {numeric:true, sensitivity:"base"}) * dir;
+  });
+
+  const frag = document.createDocumentFragment();
+  dataRows.forEach(r => frag.appendChild(r));
+  table.tBodies.length ? table.tBodies[0].appendChild(frag) : table.appendChild(frag);
+  updateSortArrows();
+}
+function updateSortArrows(){
+  const table = document.getElementById("pb");
+  if(!table) return;
+  const headers = table.rows[0].cells;
+  for(let i=0;i<headers.length;i++){
+    let arrow = headers[i].querySelector(".arrow");
+    if(!arrow){
+      arrow = document.createElement("span");
+      arrow.className = "arrow";
+      headers[i].insertBefore(arrow, headers[i].firstChild);
+    }
+    if(i === sortState.col){
+      arrow.textContent = (sortState.dir === 1) ? "↑" : "↓";
+    } else {
+      arrow.textContent = "";
+    }
   }
 }
 function filterTable(){
-  var q=document.getElementById("q").value.toLowerCase();
-  var table=document.getElementById("pb"); var rows=table.getElementsByTagName("tr");
-  for(var i=1;i<rows.length;i++){
-    var t=rows[i].innerText.toLowerCase();
-    rows[i].style.display = (t.indexOf(q)>-1) ? "" : "none";
+  const q = document.getElementById("q").value.toLowerCase();
+  const table = document.getElementById("pb");
+  if(!table) return;
+  const rows = Array.from(table.rows).slice(1);
+  for(const r of rows){
+    const t = r.innerText.toLowerCase();
+    r.style.display = (t.indexOf(q)>-1) ? "" : "none";
   }
 }
 </script>
 "@
 
-$pre = "<div class='small'>Generated: $generatedAt</div><input id='q' onkeyup='filterTable()' placeholder='جستجو...'>"
+$pre = "<div class='small'>Generated: $generatedAt</div><div style='width:100%;margin-block:1rem; text-align:center;'><input id='q' onkeyup='filterTable()' placeholder='جستجو...'></div>"
+$domain = "@toraibka.co"
 
-# تبدیل لیست به جدول HTML
-$table = $rows |
+$rowsHtml = $rows | ForEach-Object {
+    $email = ("{0}{1}" -f $_.SamAccountName, $domain)
+    [pscustomobject]@{
+        Id        = $_.Id
+        FirstName = $_.FirstName
+        LastName  = $_.LastName
+        Phone     = $_.Phone   # اینجا HTML (div/ul/li) داریم
+        Job       = $_.Job
+        Email     = "<a href=""mailto:$email"">$email</a>"
+    }
+}
+
+# Fragment بساز تا encode دوباره خراب نکند
+$tbl = ($rowsHtml |
     Sort-Object LastName, FirstName |
-    ConvertTo-Html -As Table -PreContent $pre `
-      -Property Id,SamAccountName,FirstName,LastName,Phone,Job
+    ConvertTo-Html -Fragment -As Table -PreContent $pre -Property Id,FirstName,LastName,Phone,Job,Email
+) -join "`n"
 
-# اضافه کردن onclick برای مرتب‌سازی
-$table = $table -replace "<table>", "<table id='pb'>"
-$table = $table -replace "<th>(.*?)</th>", "<th onclick='sortTable(this.cellIndex)'>$1</th>"
+$tbl = $tbl -replace "<table>", "<table id='pb'>"
+$tbl = $tbl -replace "<th[^>]*>Id</th>",        "<th data-type='number' onclick='sortTable(this.cellIndex)'>Id</th>"
+$tbl = $tbl -replace "<th[^>]*>FirstName</th>", "<th data-type='text'   onclick='sortTable(this.cellIndex)'>FirstName</th>"
+$tbl = $tbl -replace "<th[^>]*>LastName</th>",  "<th data-type='text'   onclick='sortTable(this.cellIndex)'>LastName</th>"
+$tbl = $tbl -replace "<th[^>]*>Phone</th>",     "<th data-type='text'   onclick='sortTable(this.cellIndex)'>Phone</th>"
+$tbl = $tbl -replace "<th[^>]*>Job</th>",       "<th data-type='text'   onclick='sortTable(this.cellIndex)'>Job</th>"
+$tbl = $tbl -replace "<th[^>]*>Email</th>",     "<th data-type='text'   onclick='sortTable(this.cellIndex)'>Email</th>"
 
-ConvertTo-Html -Head $head -Body ($table -join "`n") |
-    Out-File -FilePath $htmlFile -Encoding UTF8
+# Decode تا ul/li و mailto به HTML واقعی تبدیل شود
+$tbl = [System.Web.HttpUtility]::HtmlDecode($tbl)
 
+$html = @"
+<!doctype html>
+<html>
+<head>
+$head
+</head>
+<body>
+$tbl
+<script>updateSortArrows();</script>
+</body>
+</html>
+"@
+
+$html | Out-File -FilePath $htmlFile -Encoding UTF8
 Write-Host "Done HTML: $htmlFile"
+
+# ---------- Upload to MikroTik (FTP) ----------
+$mtIp   = "192.168.1.200"
+$mtUser = "admin"
+$mtPass = "1376mhn2"
+
+$uri1 = "ftp://$mtIp/cn.xml"
+
+$wc = New-Object System.Net.WebClient
+$wc.Credentials = New-Object System.Net.NetworkCredential($mtUser,$mtPass)
+$wc.UploadFile($uri1, $outFile) | Out-Null
+
+Write-Host "Uploaded to MikroTik via FTP: $mtIp" -ForegroundColor Green
