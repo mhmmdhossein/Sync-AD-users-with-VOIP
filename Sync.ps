@@ -1,0 +1,168 @@
+Import-Module ActiveDirectory
+
+$logFile = "C:\Reports\phonebook.log"
+"==== Run started $(Get-Date) ====" | Out-File $logFile -Encoding UTF8
+
+$outFile  = "C:\Reports\phonebook.xml"
+$htmlFile = "C:\Reports\phonebook.html"
+New-Item -ItemType Directory -Path (Split-Path $outFile) -Force | Out-Null
+
+# ---------- XML ----------
+$xml  = New-Object System.Xml.XmlDocument
+$decl = $xml.CreateXmlDeclaration("1.0","UTF-8",$null)
+$xml.AppendChild($decl) | Out-Null
+
+$root = $xml.CreateElement("AddressBook")
+$xml.AppendChild($root) | Out-Null
+
+function Add-PbGroup {
+    param([int]$id,[string]$name)
+
+    $g = $xml.CreateElement("pbgroup")
+    $idNode = $xml.CreateElement("id");   $idNode.InnerText = "$id"
+    $nmNode = $xml.CreateElement("name"); $nmNode.InnerText = "$name"
+    $g.AppendChild($idNode) | Out-Null
+    $g.AppendChild($nmNode) | Out-Null
+    $root.AppendChild($g)   | Out-Null
+}
+
+Add-PbGroup 1 "Blacklist"
+Add-PbGroup 2 "Whitelist"
+
+# ---------- AD Query ----------
+$users = Get-ADUser -Filter * -Properties GivenName,Surname,DisplayName,SamAccountName,Enabled,Department,Title,telephoneNumber,ipPhone |
+Where-Object {
+    $_.Enabled -eq $true -and
+    $_.SamAccountName -notlike "HealthMailbox*" -and
+    $_.SamAccountName -notlike "SystemMailbox*" -and
+    $_.SamAccountName -notlike "DiscoverySearchMailbox*"
+}
+
+# ---------- HTML data collector ----------
+$rows = New-Object System.Collections.Generic.List[object]
+
+# ---------- Build Contacts ----------
+$id = 1
+foreach ($u in $users) {
+
+    $numValue = if ($u.ipPhone) { $u.ipPhone } elseif ($u.telephoneNumber) { $u.telephoneNumber } else { $null }
+    if (-not $numValue) { continue }   # حذف افراد بدون شماره (اگر نمی‌خوای، این خط رو بردار)
+
+    $deptOrTitle = if ($u.Department) { $u.Department } elseif ($u.Title) { $u.Title } else { "" }
+
+    Write-Host "Processing:" -ForegroundColor Cyan
+    Write-Host "  SamAccountName:" $u.SamAccountName
+    Write-Host "  GivenName     :" $u.GivenName
+    Write-Host "  Surname       :" $u.Surname
+    Write-Host "  Phone         :" $numValue
+    Write-Host "-----------------------------"
+
+    $logLine = "{0} | User={1} | GivenName={2} | Surname={3} | Phone={4}" -f `
+        (Get-Date), $u.SamAccountName, $u.GivenName, $u.Surname, $numValue
+    $logLine | Out-File $logFile -Append -Encoding UTF8
+
+    # --- XML Contact ---
+    $contact = $xml.CreateElement("Contact")
+
+    $idNode = $xml.CreateElement("id"); $idNode.InnerText = "$id"
+    $contact.AppendChild($idNode) | Out-Null
+
+    $fn = $xml.CreateElement("FirstName"); $fn.InnerText = $(if ($u.GivenName) { $u.GivenName } else { "" })
+    $ln = $xml.CreateElement("LastName");  $ln.InnerText = $(if ($u.Surname)   { $u.Surname }   else { "" })
+    $contact.AppendChild($fn) | Out-Null
+    $contact.AppendChild($ln) | Out-Null
+
+    $fr = $xml.CreateElement("Frequent"); $fr.InnerText = "0"
+    $contact.AppendChild($fr) | Out-Null
+
+    $phone = $xml.CreateElement("Phone")
+    $typeAttr = $xml.CreateAttribute("type"); $typeAttr.Value = "Work"
+    $phone.Attributes.Append($typeAttr) | Out-Null
+
+    $pn = $xml.CreateElement("phonenumber"); $pn.InnerText = "$numValue"
+    $ai = $xml.CreateElement("accountindex"); $ai.InnerText = "0"
+    $phone.AppendChild($pn) | Out-Null
+    $phone.AppendChild($ai) | Out-Null
+    $contact.AppendChild($phone) | Out-Null
+
+    $pr = $xml.CreateElement("Primary"); $pr.InnerText = "0"
+    $contact.AppendChild($pr) | Out-Null
+
+    $job = $xml.CreateElement("Job"); $job.InnerText = $deptOrTitle
+    $contact.AppendChild($job) | Out-Null
+
+    $root.AppendChild($contact) | Out-Null
+
+    # --- HTML row ---
+    $rows.Add([pscustomobject]@{
+        Id            = $id
+        SamAccountName= $u.SamAccountName
+        FirstName     = $(if ($u.GivenName) { $u.GivenName } else { "" })
+        LastName      = $(if ($u.Surname)   { $u.Surname }   else { "" })
+        Phone         = $numValue
+        Job           = $deptOrTitle
+    }) | Out-Null
+
+    $id++
+}
+
+# ---------- Save XML ----------
+$xml.Save($outFile)
+Write-Host "Done XML: $outFile"
+
+# ---------- Save HTML ----------
+$generatedAt = Get-Date
+$head = @"
+<meta charset="utf-8">
+<title>Phonebook</title>
+<style>
+body{font-family:Segoe UI,Tahoma,Arial;direction:rtl;margin:20px}
+table{border-collapse:collapse;width:100%}
+th,td{border:1px solid #ddd;padding:8px}
+th{cursor:pointer;position:sticky;top:0;background:#f5f5f5}
+tr:nth-child(even){background:#fafafa}
+.small{color:#666;font-size:12px;margin-bottom:10px}
+input{width:320px;padding:8px;margin:10px 0}
+</style>
+<script>
+function sortTable(n){
+  var table=document.getElementById("pb"), switching=true, dir="asc", sw, i, x, y, shouldSwitch;
+  while(switching){
+    switching=false; var rows=table.rows;
+    for(i=1;i<rows.length-1;i++){
+      shouldSwitch=false;
+      x=rows[i].getElementsByTagName("TD")[n].innerText.toLowerCase();
+      y=rows[i+1].getElementsByTagName("TD")[n].innerText.toLowerCase();
+      if((dir=="asc" && x>y) || (dir=="desc" && x<y)){ shouldSwitch=true; break; }
+    }
+    if(shouldSwitch){ rows[i].parentNode.insertBefore(rows[i+1], rows[i]); switching=true; sw=true; }
+    else { if(dir=="asc"){ dir="desc"; switching=true; } }
+  }
+}
+function filterTable(){
+  var q=document.getElementById("q").value.toLowerCase();
+  var table=document.getElementById("pb"); var rows=table.getElementsByTagName("tr");
+  for(var i=1;i<rows.length;i++){
+    var t=rows[i].innerText.toLowerCase();
+    rows[i].style.display = (t.indexOf(q)>-1) ? "" : "none";
+  }
+}
+</script>
+"@
+
+$pre = "<div class='small'>Generated: $generatedAt</div><input id='q' onkeyup='filterTable()' placeholder='جستجو...'>"
+
+# تبدیل لیست به جدول HTML
+$table = $rows |
+    Sort-Object LastName, FirstName |
+    ConvertTo-Html -As Table -PreContent $pre `
+      -Property Id,SamAccountName,FirstName,LastName,Phone,Job
+
+# اضافه کردن onclick برای مرتب‌سازی
+$table = $table -replace "<table>", "<table id='pb'>"
+$table = $table -replace "<th>(.*?)</th>", "<th onclick='sortTable(this.cellIndex)'>$1</th>"
+
+ConvertTo-Html -Head $head -Body ($table -join "`n") |
+    Out-File -FilePath $htmlFile -Encoding UTF8
+
+Write-Host "Done HTML: $htmlFile"
